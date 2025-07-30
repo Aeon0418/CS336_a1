@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import os
 from typing import IO, Any, BinaryIO
 from collections.abc import Iterable
@@ -15,7 +16,13 @@ import torch.nn as nn
 # 包括线性层、嵌入层、SwiGLU、缩放点积注意力、多头自注意力、RoPE、Transformer块等。
 # 你需要实现这些函数以通过测试。
 
+from cs336_basics.train_tokenizer.train_tokenizer2 import  train_bpe, merge_token_sequence
 from cs336_basics.model.rmsnorm import RMSNorm
+from cs336_basics.model.linear import Linear
+from cs336_basics.model.embedding import Embedding
+from cs336_basics.model.swiglu import SwiGLU
+from cs336_basics.model.rope import RotaryPositionalEmbedding
+
 
 
 def run_linear(
@@ -36,8 +43,6 @@ def run_linear(
     返回:
         Float[Tensor, "... d_out"]: 线性模块的变换输出。
     """
-    from cs336_basics.model.linear import Linear
-    
     # 创建Linear层实例
     linear_layer = Linear(
         in_features=d_in, 
@@ -70,7 +75,6 @@ def run_embedding(
     返回:
         Float[Tensor, "... d_model"]: 嵌入层返回的嵌入批次。
     """
-    from cs336_basics.model.embedding import Embedding
     embedding = Embedding(vocab_size, d_model)
     with torch.no_grad():
         embedding.weight.copy_(weights)
@@ -99,7 +103,7 @@ def run_swiglu(
     返回:
         Float[Tensor, "... d_model"]: 与输入嵌入形状相同的输出嵌入。
     """
-    from cs336_basics.model.swiglu import SwiGLU,adjust_weight,run_silu
+    
     # 示例:
     # 如果你的状态字典键匹配，可以使用 `load_state_dict()`
     #swiglu.load_state_dict(weights)
@@ -254,7 +258,7 @@ def run_rope(
     返回:
         Float[Tensor, " ... sequence_length d_k"]: 应用RoPE的输入张量。
     """
-    from cs336_basics.model.rope import RotaryPositionalEmbedding
+    
     rope = RotaryPositionalEmbedding(theta, d_k, max_seq_len)
     return rope(in_query_or_key, token_positions)
 
@@ -450,6 +454,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: 与`in_features`形状相同的张量，包含对每个元素应用
         SiLU的输出。
     """
+    # 最后一维做哈达玛积
     return in_features * torch.sigmoid(in_features)
 
 
@@ -688,137 +693,11 @@ def run_train_bpe(
                 表示<token1>与<token2>合并。
                 合并按创建顺序排序。
     """
-    from collections import defaultdict 
-    import regex
-
-    # Step 1: Initialize Vocabulary 初始化词表 
-    # 字典 int: bytes对象。使用字典推导式，range(256)生成256个整数，bytes([i])表示把这个整数转换成bytes对象
-    # 第1步初始化词汇表，基础词汇表包含所有256个基础字节，对应ASCII码范围是0-255
-    # bytes([65]) 结果是 b'A'，即ASCII码65对应的字节 字典里：65: b'A', 
-    vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-    next_id = 256
-
-    special_token_bytes = [token.encode("utf-8") for token in special_tokens]
-    for token_bytes in special_token_bytes:
-        if token_bytes not in vocab.values(): # 如果词表中没有这个特殊token
-            vocab[next_id] = token_bytes #新建一个键值对 next_id加一
-            next_id += 1
-
-    # Step 2: Pre-tokenization 预分词
-
-    # token_frequency_table: Dict[Tuple[bytes], int] = {} # 用于统计每个token出现的频率，注意不能用列表，只能用tuple元组，因为列表不可哈希
-    # 会在一堆词里找，如果存在，频数加一；如果不存在，初始化为1
-    # 这张表要得到 token ： 频数
-    token_frequency_table = defaultdict(int) #总是存在没出现过的key，只好用defaultdict
-    # 用一个集合来高效检查特殊符号的字节表示是否已存在于词汇表中，用列表也能查重，但时间复杂度是O(n)，集合是O(1)
-    existing_byte_values: Set[bytes] = set(vocab.values())
-
-
-
-    #以文本方式打开 训练数据文件，读取全部内容到text变量中
-    try:
-        with open(input_path, "r", encoding="utf-8") as f:
-            text = f.read()
-    except FileNotFoundError:
-        text = ""
-
-    # 返回的 chunks 列表将包含标记之间的所有文本片段 相当于先进行一次段落分割
-    chunks = regex.split("|".join(map(regex.escape, special_tokens)), text)
-    # 结果：chunks = ["Hello world", "Another story", "End story"]
-    
-    # # 然后在大分割里小分割，按照空格和标点
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    for chunk in chunks:
-        for match in regex.finditer(PAT, chunk):  # 获取match ”hello“
-            word = match.group()  # 获取匹配的文本 “Hello”
-            word_bytes = word.encode("utf-8")  # 将匹配到的单词转换为字节: b'Hello'
-            bytes_list = [bytes([x]) for x in word_bytes] #e.g. ['h', 'e', 'l', 'l', 'o']
-            token_frequency_table[tuple(bytes_list)] += 1   
-    # token_frequency_table 的示例内容：
-    # {
-    #     (b'H', b'e', b'l', b'l', b'o'): 3,      # "Hello" 出现3次
-    #     (b'w', b'o', b'r', b'l', b'd'): 2,      # "world" 出现2次
-    #     (b't', b'h', b'e'): 5,                  # "the" 出现5次
-    # }
-
-
-    # Step 3: Compute BPE Merges
-    merges: List[Tuple[bytes, bytes]] = [] # 用于存储合并操作记录
-    
-    #一次性统计所有token的对和频率
-    pair_counts = defaultdict(int) # 用于存储字节对的频率
-
-    for token in token_frequency_table.keys():
-        for i in range(len(token) - 1):
-            pair_counts[token[i], token[i+1]] += token_frequency_table[token]
-#token[i], token[i+1]：获取相邻的两个字节，形成一个字节对
-# token_frequency_table[token]：获取这个token的出现频率
-# 将这个频率累加到对应字节对的计数中
-# 最终的 pair_counts：
-# {
-#     (b'H', b'e'): 4,    # H-e 组合总共出现4次
-#     (b'e', b'l'): 4,    # e-l 组合总共出现4次  
-#     (b'l', b'l'): 3,    # l-l 组合总共出现3次
-#     (b'l', b'o'): 3,    # l-o 组合总共出现3次
-#     (b'l', b'p'): 1,    # l-p 组合总共出现1次
-#     (b't', b'h'): 2,    # t-h 组合总共出现2次
-#     (b'h', b'e'): 2,    # h-e 组合总共出现2次
-# }
-
-
-    # # 第4步开始训练BPE算法
-    while len(vocab) < vocab_size: # 添加新的token直到词汇表达到指定大小
-        if not pair_counts:
-            break  # No more pairs to merge
-
-        # Find the most frequent pair(s)
-        max_count = max(pair_counts.values())
-        candidates = [k for k, v in pair_counts.items() if v == max_count]
-        # 在候选者中，选择字节序最大的那个
-        best_pair = max(candidates)
-
-        merges.append(best_pair)
-
-        # Create new token
-        new_token_bytes = best_pair[0] + best_pair[1] # 将最佳token对的两个token连接起来
-        vocab[next_id] = new_token_bytes
-        next_id += 1
-
-        #记录受影响的token，也就是包含best_pair的来自token_frequency_table的token
-        affected_tokens = []
-        for token, freq in token_frequency_table.items():
-            has_pair = any(token[i:i+2] == best_pair for i in range(len(token) - 1))
-            if has_pair:
-                affected_tokens.append((token, freq))
-        #从受影响的token中出发,每个token就是token_frequency_table的key
-        for token, freq in affected_tokens:
-            # 删除pair_counts中对应的best_pair
-            for i in range(len(token) - 1):
-                pair_counts[token[i], token[i+1]] -= freq
-                if pair_counts[token[i], token[i+1]] <= 0:
-                    del pair_counts[token[i], token[i+1]]
-            # 将best_pair合并为new_token
-            new_token_frequency_seq = merge_token_sequence(token, best_pair, new_token_bytes)
-            # 更新pair_counts
-            for i in range(len(new_token_frequency_seq)-1):
-                pair = (new_token_frequency_seq[i], new_token_frequency_seq[i+1])
-                pair_counts[pair] += freq
-            # 更新token_frequency_table
-            del token_frequency_table[token]
-            token_frequency_table[new_token_frequency_seq] += freq
+    vocab, merges = train_bpe(
+        input_path=input_path,
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+        **kwargs
+    )
 
     return vocab, merges # 返回最终的词汇表和合并记录
-
-def merge_token_sequence(token_seq: Tuple, best_pair: Tuple, new_token: bytes) -> Tuple:
-    """在一个token序列中，将所有出现的 best_pair 合并为 new_token"""
-    new_seq = []
-    i = 0
-    while i < len(token_seq):
-        # 检查当前位置是否是最佳对的开始
-        if i < len(token_seq) - 1 and (token_seq[i], token_seq[i+1]) == best_pair:
-            new_seq.append(new_token)
-            i += 2
-        else:
-            new_seq.append(token_seq[i])
-            i += 1
-    return tuple(new_seq)

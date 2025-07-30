@@ -5,26 +5,28 @@ from jaxtyping import Float, Int  #用来给函数签名做更精确的张量形
 
 
 class Embedding(nn.Module):
-    '''
-    数字到 d_model的查表映射
-    '''
     def __init__(self,num_embedding,embedding_dim,device=None,dtype=None):
         super().__init__()
+        self.num_embedding = num_embedding # 词汇表大小
+        self.embedding_dim = embedding_dim # 嵌入维度
         factory_kwargs = {'device': device, 'dtype': dtype}
+        # 包起来更简洁
 
-        # 创建空的权重矩阵，从vocab_size到d_model
-        weight = torch.empty(num_embedding,embedding_dim,**factory_kwargs)
+        #把这个张量，注册到模型里
+        self.weight = nn.Parameter(
+            torch.empty(num_embedding, embedding_dim, **factory_kwargs
+            ))
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=1.0, a=-3, b=3)
 
-        torch.nn.init.trunc_normal_(weight, mean=0.0, std=1.0, a=-3, b=3)
 
-        #把这个张量包装成可训练的参数，注册到模型里
-        self.weight = nn.Parameter(weight)
-
+        
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         #token_ids：通常是一个整数张量（任意形状），每个元素是一个 token 的 ID
         #利用 PyTorch 的张量索引功能直接做查表（lookup），输出形状 [..., d_model] 的嵌入向量。
+        # 取出对应的行向量 
         out = self.weight[token_ids]
         return out
+
 
 
 

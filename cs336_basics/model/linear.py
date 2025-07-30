@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from jaxtyping import Float, Int
+import einx
+
 
 ## 理解要求
 # 继承自 torch.nn.Module
@@ -51,7 +53,14 @@ class Linear(nn.Module):
             torch.nn.init.trunc_normal_(self.weight, std=std)
 
         def forward(self,x: Tensor)-> Tensor:
-            return x @ self.weight.T
+            # 使用 einx 进行矩阵乘法
+            # "... d_in, d_out d_in -> ... d_out" 表示：
+            # 输入: (..., d_in)，权重: (d_out, d_in)
+            # 输出: (..., d_out)
+            return einx.dot("... d_in, d_out d_in -> ... d_out", x, self.weight)
+
+            # # 矩阵乘法有广播机制，只会对最后两维进行矩阵乘法
+            # return x @ self.weight.T
 
 def run_linear(
     d_in: int,

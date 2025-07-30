@@ -69,6 +69,22 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 def gpt2_pre_tokenize(text: str) -> list:
+    """使用 GPT-2 的分词规则预分词文本。
+    此函数根据 GPT-2 的预分词模式将文本分割成词符，处理以下情况：
+    - 缩写（例如，'s, 'll, 've, 're）
+    - 包含字母的单词
+    - 数字
+    - 标点符号和特殊字符
+    - 空白字符
+    参数:
+        text (str): 需要预分词的输入文本
+    返回:
+        list: 基于 GPT-2 预分词规则的字符串词符列表
+    示例:
+        >>> gpt2_pre_tokenize("I'll go to NY!")
+        ["I", "'ll", " go", " to", " NY", "!"]
+    """
+
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     return [m.group() for m in re.finditer(PAT, text)]
 
@@ -128,111 +144,155 @@ def _update_stats(
 
 # 将 count_tokens_in_chunk 移到模块级别
 def count_tokens_in_chunk(start: int, end: int, input_path: str, special_tokens: list[str]) -> dict[bytes, int]:
-    """统计文件块中的token频率"""
+    """统计文件块中的token频率
+    返回一个字典，键为token的字节序列，值为该token在块中的出现频率。
+    """
+    # 初始化默认字典用于存储频率统计
     freq: dict[bytes, int] = defaultdict(int)
+    # 将特殊token转换为字节序列
     special_token_bytes = {tok.encode("utf-8") for tok in special_tokens}
 
+    # 打开输入文件
     with open(input_path, 'rb') as f:
+        # 使用内存映射提高大文件读取效率
         mmapped = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        # 移动到块的起始位置
         mmapped.seek(start)
+        # 读取块内容并解码为Unicode字符串
         chunk = mmapped.read(end - start).decode('utf-8', errors='ignore')
-        tokens = tokenize_chunk((chunk, special_tokens))  # this returns list[str]
+        # 对块进行分词
+        tokens = tokenize_chunk((chunk, special_tokens))  # 返回list[str]
+        # 统计每个token的频率
         for tok in tokens:
+            # 将token转换为字节序列
             b = tok.encode('utf-8')
+            # 跳过特殊token
             if b in special_token_bytes:
                 continue
+            # 增加token频率计数
             freq[b] += 1
     return freq
 
-def run_train_bpe(
+def merge_token_sequence(token_seq: Tuple, best_pair: Tuple, new_token: bytes) -> Tuple:
+    """在一个token序列中，将所有出现的 best_pair 合并为 new_token"""
+    new_seq = []
+    i = 0
+    while i < len(token_seq):
+        # 检查当前位置是否是最佳对的开始
+        if i < len(token_seq) - 1 and (token_seq[i], token_seq[i+1]) == best_pair:
+            new_seq.append(new_token)
+            i += 2
+        else:
+            new_seq.append(token_seq[i])
+            i += 1
+    return tuple(new_seq)
+
+
+
+
+def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
+    """训练BPE分词器，并返回词汇表和合并规则。
+    参数:
+        input_path: BPE分词器训练数据的文件路径
+        vocab_size: 词汇表总大小（包含特殊token）
+        special_tokens: 特殊token列表，这些token不会被分割
+            这些token将始终作为单个token保留。如果这些特殊token出现在input_path中，
+            它们会被当作普通字符串处理。
 
-    Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
-
-    Returns:
+    返回:
         tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
+            vocab: 训练好的分词器词汇表，从token ID映射到token字节序列
+            merges: BPE合并规则列表。每个列表项是一个字节元组(token1, token2)，
+                   表示token1和token2被合并。合并规则按创建顺序排列。
+            装在一个不可改动的Tuple中返回。
     """
+    # 设置并行处理参数
     num_processes = 8
     num_chunks = 4 * num_processes
+    # 将特殊token转换为字节序列
     special_token_bytes = {tok.encode("utf-8") for tok in special_tokens}
     
+    # 读取文件并找到分块边界
     with open(input_path, 'rb') as f:
         boundaries = find_chunk_boundaries(f, num_chunks, special_tokens[0].encode('utf-8'))
     
-    # 现在可以正常使用并行处理
+    # 并行处理：统计每个块中token的频率
     results = Parallel(n_jobs=num_processes)(
         delayed(count_tokens_in_chunk)(start, end, input_path, special_tokens)
         for start, end in zip(boundaries[:-1], boundaries[1:])
     )
     
-    vocab: dict[int, bytes] = {}
-    merges: list[tuple[bytes, bytes]] = []
-    token_freqs = defaultdict(int)
+    # 初始化数据结构
+    vocab: dict[int, bytes] = {}      # 词汇表：token_id -> token_bytes
+    merges: list[tuple[bytes, bytes]] = []  # 合并规则列表
+    token_freqs = defaultdict(int)    # token频率统计
     
+    # 合并所有块的统计结果
     for local_freq in results:
         for token, count in local_freq.items():
             token_freqs[token] += count
     
+    # 首先将特殊token添加到词汇表
     token_id = 0
     for special_token in special_tokens:
         vocab[token_id] = special_token.encode('utf-8')
         token_id += 1
     
+    # 添加基础字节到词汇表（0-255）
     for i in range(256):
         b = bytes([i])
         if b not in special_token_bytes:
             vocab[token_id] = b
             token_id += 1
     
+    # 初始化词的分割状态：每个词初始被分割成单个字节
     split_freqs: dict[bytes, list[bytes]] = {token: [bytes([b]) for b in token] for token in token_freqs}
+    # 用于存储相邻对的频率
     pair_freqs: defaultdict[tuple[bytes, bytes], int] = defaultdict(int)
+    # 用于存储每个相邻对出现在哪些词中
     pair_to_words: defaultdict[tuple[bytes, bytes], set[bytes]] = defaultdict(set)
 
+    # 初始化统计信息
     for word, split in split_freqs.items():
         word_freq = token_freqs[word]
         _update_stats(word, split, word_freq, pair_freqs, pair_to_words, is_add=True)
 
+    # 计算需要执行的合并次数
     nvocab = len(vocab)
     num_merges = vocab_size - nvocab
     
+    # 主循环：执行BPE合并
     for i in tqdm(range(num_merges)):
-        if not pair_freqs:
+        if not pair_freqs:  # 如果没有可合并的对了就退出
             break
+        # 选择频率最高的对进行合并
         best_pair = max(pair_freqs.items(), key=lambda x: (x[1], x[0]))[0]
  
+        # 记录合并规则并创建新token
         merges.append(best_pair)
         new_token = best_pair[0] + best_pair[1]
         vocab[nvocab] = new_token
         nvocab += 1
         
+        # 获取需要被合并的token对
         p1, p2 = best_pair
+        # 获取所有包含这对token的词
         words_to_update = list(pair_to_words[best_pair])
 
+        # 更新受影响的词的分割状态
         for word in words_to_update:
             word_freq = token_freqs[word]
             old_split = split_freqs[word]
             
+            # 移除旧的统计信息
             _update_stats(word, old_split, word_freq, pair_freqs, pair_to_words, is_add=False)
             
+            # 执行合并操作
             new_split = []
             i = 0
             while i < len(old_split):
@@ -243,6 +303,7 @@ def run_train_bpe(
                     new_split.append(old_split[i])
                     i += 1
             
+            # 更新分割状态和统计信息
             split_freqs[word] = new_split
             _update_stats(word, new_split, word_freq, pair_freqs, pair_to_words, is_add=True)
     
@@ -262,7 +323,7 @@ if  __name__ == "__main__":
     print("-" * 50)
 
 
-    vocab, merges = run_train_bpe(
+    vocab, merges = train_bpe(
         input_path=input_path,
         vocab_size=vocab_size,
         special_tokens=special_tokens,
