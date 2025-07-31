@@ -22,6 +22,8 @@ from cs336_basics.model.linear import Linear
 from cs336_basics.model.embedding import Embedding
 from cs336_basics.model.swiglu import SwiGLU
 from cs336_basics.model.rope import RotaryPositionalEmbedding
+from cs336_basics.model.msa import Multihead_self_attention
+from cs336_basics.model.transformer import Transformer_block, Transformer_lm
 
 
 
@@ -225,8 +227,7 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: 使用给定QKV投影权重和输入特征
         运行优化批次多头注意力实现的输出张量。
     """
-    from cs336_basics.model.msa import Multihead_self_attention
-    from cs336_basics.model.rope import RotaryPositionalEmbedding
+    
     rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len)
     
     # 创建多头注意力实例，只传递必要的参数
@@ -331,7 +332,16 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] 在使用RoPE时
         在输入特征上运行Transformer块的输出张量。
     """
-    raise NotImplementedError
+    block = Transformer_block(d_model=d_model, num_heads=num_heads, d_ff=d_ff, max_seq_len=max_seq_len, theta=theta)
+    with torch.no_grad():
+        block.rmsn_1.weight.copy_(weights['ln1.weight'])
+        block.attn.q_proj.weight.copy_(weights['attn.q_proj.weight'].T)
+        block.attn.k_proj.weight.copy_(weights['attn.k_proj.weight'].T)
+        block.attn.v_proj.weight.copy_(weights['attn.v_proj.weight'].T)
+        block.attn.o_proj.weight.copy_(weights['attn.output_proj.weight'].T)
+        block.rmsn_2.weight.copy_(weights['ln2.weight'])
+        block.pw_ffn.load_weights(weights['ffn.w1.weight'], weights['ffn.w2.weight'], weights['ffn.w3.weight'])
+    return block(in_features)
 
 
 def run_transformer_lm(
@@ -412,7 +422,21 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: 每个token的预测未归一化
         下一词分布的张量。
     """
-    raise NotImplementedError
+    lm = Transformer_lm(vocab_size=vocab_size, context_length=context_length, num_layers=num_layers, d_model=d_model, num_heads=num_heads, d_ff=d_ff, rope_theta=rope_theta)
+    with torch.no_grad():
+        lm.transformer.token_emb.weight.copy_(weights['token_embeddings.weight'])
+        for i in range(num_layers):
+            block = lm.transformer.n_block[i]
+            block.rmsn_1.weight.copy_(weights[f'layers.{i}.ln1.weight'])
+            block.attn.q_proj.weight.copy_(weights[f'layers.{i}.attn.q_proj.weight'].T)
+            block.attn.k_proj.weight.copy_(weights[f'layers.{i}.attn.k_proj.weight'].T)
+            block.attn.v_proj.weight.copy_(weights[f'layers.{i}.attn.v_proj.weight'].T)
+            block.attn.o_proj.weight.copy_(weights[f'layers.{i}.attn.output_proj.weight'].T)
+            block.rmsn_2.weight.copy_(weights[f'layers.{i}.ln2.weight'])
+            block.pw_ffn.load_weights(weights[f'layers.{i}.ffn.w1.weight'], weights[f'layers.{i}.ffn.w2.weight'], weights[f'layers.{i}.ffn.w3.weight'])
+        lm.transformer.rmsn_l.weight.copy_(weights['ln_final.weight'])
+        lm.linear_emb.weight.copy_(weights['lm_head.weight'].T)
+    return lm(in_indices)
 
 
 def run_rmsnorm(
