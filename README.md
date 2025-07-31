@@ -1,23 +1,24 @@
 # CS336 Spring 2025 Assignment 1
 
 ## 这是Standford CS336 作业一的仓库
-内容有
--手写tokenizer训练流程和Tokenizer类（继承nn.Module），训练一个vocabulary=10000的tokenizer，并使用
--手写Transformer大部分组件，遵循torch的格式。
--训练Transformer ,当然用的是小的数据集
+内容有  
+- 手写tokenizer训练流程和Tokenizer类（继承nn.Module），训练一个vocabulary=10000的tokenizer，保存为vocab.pkl和merges.pkl并使用   
+- 手写Transformer全部组件，遵循torch的格式。  
+- 训练4层的Transformer语言模型 ,用的是小的数据集
 ## 使用uv来管理虚拟环境
 略 -类似python虚拟环境
 ### 下载数据
-略 -就是大量txt，使用TinyStoriesV2-GPT4（2GB），owt12GB太大了
+略   
+-使用TinyStoriesV2-GPT4（2GB），owt12GB太大了
 
 使用```source .venv/bin/activate```来选择虚拟环境.  
 
 使用```uv add ipykernel```
-在jupter中使用，
+在jupter中使用，选择虚拟环境的内核即可
 
 使用
 ```
 uv run pytest tests/test_train_bpe.py
 ```
-运行测试代码，全部pass说明组件符合要求。
-![alt text](note/image-1.png)
+运行测试代码，全部pass说明组件符合要求。例如
+![alt text](note/img/image-1.png)
